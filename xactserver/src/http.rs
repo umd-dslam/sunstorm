@@ -1,3 +1,4 @@
+use anyhow::Context;
 use hyper::Server;
 use hyper::{header::CONTENT_TYPE, Body, Request, Response};
 use prometheus::{Encoder, TextEncoder};
@@ -11,34 +12,38 @@ pub fn start_http_server(
     listen_http: SocketAddr,
     cancel: CancellationToken,
 ) -> JoinHandle<Result<(), anyhow::Error>> {
-    let router_builder = Router::builder().get("/metrics", prometheus_metrics_handler);
-
     thread::Builder::new()
         .name("http".into())
         .spawn(move || {
-            let listener = TcpListener::bind(listen_http)?;
-
-            info!("Listening to HTTP on {}", listener.local_addr()?);
-
-            let service =
-                RouterService::new(router_builder.build().map_err(|err| anyhow::anyhow!(err))?)
-                    .unwrap();
-            let runtime = tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_current_thread()
                 .enable_all()
-                .build()?;
+                .build()?
+                .block_on(async {
+                    let _drop_guard = cancel.clone().drop_guard();
+                    let router_builder =
+                        Router::builder().get("/metrics", prometheus_metrics_handler);
 
-            let _guard = runtime.enter();
-            let server = Server::from_tcp(listener)?.serve(service);
-            runtime.block_on(async {
-                tokio::select! {
-                    res = server => res,
-                    _ = cancel.cancelled() => Ok(()),
-                }
-            })?;
+                    let listener = TcpListener::bind(listen_http)?;
 
-            info!("HTTP server stopped");
+                    info!("Listening to HTTP on {}", listener.local_addr()?);
 
-            Ok(())
+                    let service = RouterService::new(
+                        router_builder.build().map_err(|err| anyhow::anyhow!(err))?,
+                    )
+                    .unwrap();
+
+                    let server = Server::from_tcp(listener)?.serve(service);
+
+                    tokio::select! {
+                        res = server => res?,
+                        _ = cancel.cancelled() => {},
+                    };
+
+                    info!("HTTP server stopped");
+
+                    Ok::<(), anyhow::Error>(())
+                })
+                .context("Failed to start HTTP server")
         })
         .unwrap()
 }
