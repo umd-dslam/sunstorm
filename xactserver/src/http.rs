@@ -11,7 +11,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -164,19 +164,40 @@ async fn workload_simulator_handler(req: Request<Body>) -> anyhow::Result<Respon
     );
 
     let cancel = CancellationToken::new();
-    let sent_transactions = Arc::new(AtomicU32::new(0));
     let mut join_set = JoinSet::new();
-    for _ in 0..nclient {
+    let sent_transactions = Arc::new(AtomicU32::new(0));
+    for i in 0..nclient {
         let local_xact_tx = state.local_xact_tx.clone();
-        let cancel = cancel.clone();
         let sent_transactions = sent_transactions.clone();
-        let stopping_condition = stopping_condition.clone();
+        let cancel = cancel.clone();
+        let stopping_condition = match stopping_condition.clone() {
+            StoppingCondition::NumTransactions(ntxn) => {
+                let txn_per_client = ntxn / nclient + if i < ntxn % nclient { 1 } else { 0 };
+                StoppingCondition::NumTransactions(txn_per_client)
+            }
+            sc => sc,
+        };
         let pdist = pdist
             .iter()
             .map(|&p| Bernoulli::new(p))
             .collect::<Result<Vec<_>, _>>()?;
         join_set.spawn(async move {
+            let workload_time = Instant::now();
             while !cancel.is_cancelled() {
+                let latest_sent = sent_transactions.fetch_add(1, Ordering::SeqCst);
+                match stopping_condition {
+                    StoppingCondition::NumTransactions(ntxn) => {
+                        if latest_sent > ntxn {
+                            break;
+                        }
+                    }
+                    StoppingCondition::Duration(duration) => {
+                        if workload_time.elapsed() >= duration {
+                            break;
+                        }
+                    }
+                }
+
                 let (commit_tx, commit_rx) = oneshot::channel();
 
                 let participants = {
@@ -200,38 +221,40 @@ async fn workload_simulator_handler(req: Request<Body>) -> anyhow::Result<Respon
 
                     commit_rx.await.unwrap();
                 }
-
-                let sent = sent_transactions.fetch_add(1, Ordering::SeqCst);
-                if let StoppingCondition::NumTransactions(ntxn) = stopping_condition {
-                    if sent >= ntxn - 1 {
-                        break;
-                    }
-                }
             }
         });
     }
 
-    match stopping_condition {
-        StoppingCondition::Duration(duration) => {
-            tokio::time::sleep(duration).await;
-        }
-        StoppingCondition::NumTransactions(ntxn) => {
-            while sent_transactions.load(Ordering::SeqCst) < ntxn {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+    let report_duration = Duration::from_secs(1);
+    let mut ticker = tokio::time::interval(report_duration);
+    let mut last_reported = sent_transactions.load(Ordering::SeqCst);
+    let start_time = Instant::now();
+    loop {
+        tokio::select! {
+            task_res = join_set.join_next() => {
+                match task_res {
+                    Some(res) => res.unwrap(),
+                    None => break
+                }
+            },
+
+            _ = ticker.tick() => {
+                let sent = sent_transactions.load(Ordering::SeqCst);
+                info!("Sent {} transactions ({} txn/sec)", sent, (sent - last_reported) as f64 / report_duration.as_secs_f64());
+                last_reported = sent;
+            },
+
+            else => break,
         }
     }
 
-    cancel.cancel();
+    let sent_transactions = sent_transactions.load(Ordering::SeqCst);
+    let avg_rate = sent_transactions as f64 / start_time.elapsed().as_secs_f64();
+    let result =
+        format!("Sent {sent_transactions} transactions. Average rate: {avg_rate:.1} txn/sec");
 
-    for _ in 0..nclient {
-        join_set.join_next().await;
-    }
+    info!("Done - {result}");
 
-    let result = format!(
-        "Sent {} transactions",
-        sent_transactions.load(Ordering::SeqCst)
-    );
     Ok(Response::builder()
         .status(200)
         .body(Body::from(result))
