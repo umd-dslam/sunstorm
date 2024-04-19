@@ -1,6 +1,7 @@
 pub mod decoder;
 pub mod pg;
 
+mod http;
 mod id;
 mod manager;
 mod metrics;
@@ -10,6 +11,7 @@ mod proto {
     tonic::include_proto!("xactserver");
 }
 
+pub use http::start_http_server;
 pub use id::{NodeId, XactId};
 pub use manager::Manager;
 pub use node::Node;
