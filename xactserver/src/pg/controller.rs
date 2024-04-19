@@ -1,9 +1,8 @@
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use bytes::Bytes;
 use tokio::sync::oneshot;
 
-use crate::{pg::PgConnectionPool, RollbackInfo, XactId};
+use crate::{pg::PgConnectionPool, RollbackInfo, XactData, XactId};
 
 #[async_trait]
 pub trait XactController {
@@ -53,12 +52,12 @@ impl XactController for LocalXactController {
 
 pub struct SurrogateXactController {
     xact_id: XactId,
-    data: Bytes,
+    data: XactData,
     pg_conn_pool: PgConnectionPool,
 }
 
 impl SurrogateXactController {
-    pub fn new(xact_id: XactId, data: Bytes, pg_conn_pool: PgConnectionPool) -> Self {
+    pub fn new(xact_id: XactId, data: XactData, pg_conn_pool: PgConnectionPool) -> Self {
         Self {
             xact_id,
             data,
@@ -70,6 +69,10 @@ impl SurrogateXactController {
 #[async_trait]
 impl XactController for SurrogateXactController {
     async fn execute(&mut self) -> anyhow::Result<()> {
+        let XactData::Encoded(data) = &self.data else {
+            return Ok(());
+        };
+
         let conn = self.pg_conn_pool.get().await?;
 
         conn.batch_execute("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE")
@@ -79,7 +82,7 @@ impl XactController for SurrogateXactController {
         let result = conn
             .execute(
                 "SELECT validate_and_apply_xact($1::bytea);",
-                &[&self.data.as_ref()],
+                &[&data.as_ref()],
             )
             .await
             .with_context(|| format!("Failed to validate xact {}", self.xact_id));
@@ -96,6 +99,10 @@ impl XactController for SurrogateXactController {
     }
 
     async fn commit(&mut self) -> anyhow::Result<()> {
+        let XactData::Encoded(_) = &self.data else {
+            return Ok(());
+        };
+
         let conn = self.pg_conn_pool.get().await?;
 
         conn.batch_execute(format!("COMMIT PREPARED '{}'", self.xact_id).as_str())
@@ -106,6 +113,10 @@ impl XactController for SurrogateXactController {
     }
 
     async fn rollback(&mut self, _info: &RollbackInfo) -> anyhow::Result<()> {
+        let XactData::Encoded(_) = &self.data else {
+            return Ok(());
+        };
+
         let conn = self.pg_conn_pool.get().await?;
 
         let prepared_xact = conn

@@ -4,10 +4,11 @@ use crate::metrics::{
 };
 use crate::node::client;
 use crate::pg::{create_pg_conn_pool, PgConnectionPool};
-use crate::proto::{PrepareMessage, VoteMessage};
+use crate::proto::{prepare_message, PrepareMessage, SimulatedData, VoteMessage};
 use crate::xact::XactType;
-use crate::{NodeId, RollbackInfo, XactId, XactStatus, XsMessage};
+use crate::{NodeId, RollbackInfo, XactData, XactId, XactStatus, XsMessage};
 use anyhow::Context;
+use bit_set::BitSet;
 use bytes::Bytes;
 use futures::{future, Future};
 use prometheus::HistogramTimer;
@@ -170,7 +171,7 @@ impl XactStateManager {
         }
     }
 
-    #[instrument(skip_all, fields(xact_id = %self.xact_id, node_id = %self.node_id))]
+    #[instrument(skip_all, fields(node_id = %self.node_id, xact_id = %self.xact_id))]
     async fn run(mut self, mut msg_rx: mpsc::Receiver<XsMessage>, cancel: CancellationToken) {
         loop {
             tokio::select! {
@@ -210,13 +211,12 @@ impl XactStateManager {
                 }
             }
         }
-
-        debug!("Stopped");
     }
 
+    #[instrument(skip_all, "local_xact", fields(xact = ?self.xact))]
     async fn handle_local_xact_msg(
         &mut self,
-        data: Bytes,
+        data: XactData,
         commit_tx: oneshot::Sender<Option<RollbackInfo>>,
     ) -> anyhow::Result<bool> {
         // This is a local transaction so the current region is the coordinator
@@ -226,30 +226,45 @@ impl XactStateManager {
         self.begin_xact_measurement();
 
         // Deserialize the transaction data
-        let mut rwset = RWSet::decode(data.clone()).context("Failed to decode read/write set")?;
-        debug!("{:#?}", rwset.decode_rest());
+        let participants = match &data {
+            XactData::Encoded(data) => {
+                let rwset =
+                    RWSet::decode(data.clone()).context("Failed to decode read/write set")?;
+                debug!("{rwset:#?}");
+                rwset.participants()
+            }
+            XactData::Simulated { participants } => {
+                debug!("Simulated for {participants:?}");
+                participants.clone()
+            }
+        };
 
         // Create and initialize a new local xact
         let status = self
             .xact
-            .init_as_local(
-                self.node_id,
-                coordinator_id,
-                rwset.participants(),
-                commit_tx,
-            )
+            .init_as_local(self.node_id, coordinator_id, &participants, commit_tx)
             .await?;
 
         assert_eq!(status, &XactStatus::Waiting);
 
+        // Encode the transaction data
+        let data = match data {
+            XactData::Encoded(data) => prepare_message::Data::Encoded(data.into_iter().collect()),
+            XactData::Simulated { participants } => {
+                prepare_message::Data::Simulated(SimulatedData {
+                    participants: participants.into_bit_vec().to_bytes(),
+                })
+            }
+        };
+
         // Send the transaction to other participants
-        self.send_to_all_but_me(&rwset.participants(), |p| {
+        self.send_to_all_but_me(&participants, |p| {
             let from = self.node_id;
             let peers = self.peers.clone();
             let message = PrepareMessage {
                 from: from.into(),
                 xact_id: self.xact_id.into(),
-                data: data.clone().into_iter().collect(),
+                data: Some(data.clone()),
             };
             async move {
                 let mut client = {
@@ -280,6 +295,7 @@ impl XactStateManager {
         Ok(false)
     }
 
+    #[instrument(skip_all, "prepare", fields(xact = ?self.xact))]
     async fn handle_prepare_msg(&mut self, prepare: PrepareMessage) -> anyhow::Result<bool> {
         // Extract the coordinator of this transaction from the request
         let coordinator_id = *self.coordinator_id.insert(prepare.from.into());
@@ -288,12 +304,31 @@ impl XactStateManager {
         self.begin_xact_measurement();
 
         // Deserialize the transaction data
-        let data = Bytes::from(prepare.data);
-        let mut rwset = RWSet::decode(data.clone()).context("Failed to decode read/write set")?;
-        debug!("{:#?}", rwset.decode_rest());
+        let (data, participants) = match prepare.data {
+            Some(prepare_message::Data::Encoded(data)) => {
+                let data = Bytes::from(data);
+                let rwset =
+                    RWSet::decode(data.clone()).context("Failed to decode read/write set")?;
+                debug!("{rwset:#?}");
+                (XactData::Encoded(data), rwset.participants())
+            }
+            Some(prepare_message::Data::Simulated(simulated_data)) => {
+                let participants = BitSet::from_bytes(&simulated_data.participants);
+                debug!("Simulated for {participants:?}");
+                (
+                    XactData::Simulated {
+                        participants: participants.clone(),
+                    },
+                    participants,
+                )
+            }
+            None => {
+                panic!("Prepare message does not contain transaction data");
+            }
+        };
 
         // If this node does not involve in the remotexact, stop the transaction immediately.
-        if !rwset.participants().contains(self.node_id.into()) {
+        if !participants.contains(self.node_id.into()) {
             warn!(
                 "Received a transaction from {:?} that I do not participate in",
                 self.node_id
@@ -308,7 +343,7 @@ impl XactStateManager {
                 self.xact_id,
                 self.node_id,
                 coordinator_id,
-                rwset.participants(),
+                &participants,
                 data,
                 &self.pg_conn_pool,
             )
@@ -329,7 +364,7 @@ impl XactStateManager {
         };
 
         // Send the vote to other participants
-        self.send_to_all_but_me(&rwset.participants(), |p| {
+        self.send_to_all_but_me(&participants, |p| {
             let from = self.node_id;
             let peers = self.peers.clone();
             let message = VoteMessage {
@@ -365,6 +400,9 @@ impl XactStateManager {
 
         let status = self.xact.try_finish().await?;
         let finished = status.is_terminal();
+        if finished {
+            debug!("Finished with status {status:?}");
+        }
         if let Some(label) = get_rollback_reason_label(status) {
             self.end_xact_measurement(label);
         }
@@ -372,11 +410,17 @@ impl XactStateManager {
         Ok(finished)
     }
 
+    #[instrument(skip_all, "vote", fields(xact = ?self.xact))]
     async fn handle_vote_msg(&mut self, vote: VoteMessage) -> anyhow::Result<bool> {
+        debug!("{vote:?}");
+
         self.xact.add_vote(vote.into()).await?;
 
         let status = self.xact.try_finish().await?;
         let finished = status.is_terminal();
+        if finished {
+            debug!("Finished with status {status:?}");
+        }
         if let Some(label) = get_rollback_reason_label(status) {
             self.end_xact_measurement(label);
         }

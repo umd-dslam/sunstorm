@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use super::XactStatus;
 use crate::metrics::EXECUTION_DURATION;
 use crate::pg::XactController;
@@ -15,18 +17,27 @@ pub struct XactState<C: XactController> {
     controller: C,
 }
 
+impl<C: XactController> Debug for XactState<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Xact")
+            .field("status", &self.status)
+            .field("participants", &self.participants)
+            .finish()
+    }
+}
+
 impl<C: XactController> XactState<C> {
     pub(super) fn new(
         node_id: NodeId,
         coordinator: NodeId,
-        participants: BitSet,
+        participants: &BitSet,
         controller: C,
     ) -> Self {
         Self {
             node_id,
             coordinator,
             status: XactStatus::Uninitialized,
-            participants,
+            participants: participants.clone(),
             voted: BitSet::new(),
             controller,
         }

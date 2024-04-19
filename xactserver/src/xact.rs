@@ -1,10 +1,9 @@
 mod state;
 
 use crate::pg::{LocalXactController, PgConnectionPool, SurrogateXactController};
-use crate::{NodeId, RollbackInfo, Vote, XactId};
+use crate::{NodeId, RollbackInfo, Vote, XactData, XactId};
 use anyhow::Context;
 use bit_set::BitSet;
-use bytes::Bytes;
 use state::XactState;
 use tokio::sync::oneshot;
 
@@ -24,6 +23,7 @@ impl XactStatus {
     }
 }
 
+#[derive(Debug)]
 pub enum XactType {
     Unknown(Vec<Vote>),
     Local(XactState<LocalXactController>),
@@ -41,7 +41,7 @@ impl XactType {
         &mut self,
         node_id: NodeId,
         coordinator: NodeId,
-        participants: BitSet,
+        participants: &BitSet,
         commit_tx: oneshot::Sender<Option<RollbackInfo>>,
     ) -> anyhow::Result<&XactStatus> {
         let controller = LocalXactController::new(commit_tx);
@@ -60,8 +60,8 @@ impl XactType {
         xact_id: XactId,
         node_id: NodeId,
         coordinator: NodeId,
-        participants: BitSet,
-        data: Bytes,
+        participants: &BitSet,
+        data: XactData,
         pg_conn_pool: &PgConnectionPool,
     ) -> anyhow::Result<&XactStatus> {
         let controller = SurrogateXactController::new(xact_id, data, pg_conn_pool.clone());
@@ -114,6 +114,7 @@ mod tests {
     use super::*;
     use crate::pg::create_pg_conn_pool;
     use crate::RollbackReason;
+    use bytes::Bytes;
     use tokio::time::{timeout, Duration};
     use tracing_test::traced_test;
 
@@ -133,7 +134,7 @@ mod tests {
             .init_as_local(
                 NodeId(1),
                 NodeId(1),
-                participants(&[NodeId(1), NodeId(3), NodeId(4)]),
+                &participants(&[NodeId(1), NodeId(3), NodeId(4)]),
                 commit_tx,
             )
             .await?;
@@ -161,7 +162,7 @@ mod tests {
             .init_as_local(
                 NodeId(1),
                 NodeId(1),
-                participants(&[NodeId(1), NodeId(3), NodeId(4)]),
+                &participants(&[NodeId(1), NodeId(3), NodeId(4)]),
                 commit_tx,
             )
             .await?;
@@ -205,8 +206,8 @@ mod tests {
                 xact_id,
                 NodeId(2),
                 NodeId(1),
-                participants(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]),
-                Bytes::from("data"),
+                &participants(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]),
+                XactData::Encoded(Bytes::from("data")),
                 &pg_conn_pool,
             )
             .await?;
@@ -253,8 +254,8 @@ mod tests {
                 xact_id,
                 NodeId(2),
                 NodeId(1),
-                participants(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]),
-                Bytes::from("data"),
+                &participants(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]),
+                XactData::Encoded(Bytes::from("data")),
                 &pg_conn_pool,
             )
             .await?;
@@ -309,8 +310,8 @@ mod tests {
                 xact_id,
                 NodeId(2),
                 NodeId(1),
-                participants(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]),
-                Bytes::from("data"),
+                &participants(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]),
+                XactData::Encoded(Bytes::from("data")),
                 &pg_conn_pool,
             )
             .await?;
@@ -358,8 +359,8 @@ mod tests {
                 xact_id,
                 NodeId(2),
                 NodeId(1),
-                participants(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]),
-                Bytes::from("data"),
+                &participants(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]),
+                XactData::Encoded(Bytes::from("data")),
                 &pg_conn_pool,
             )
             .await?;
@@ -407,8 +408,8 @@ mod tests {
                 xact_id,
                 NodeId(2),
                 NodeId(1),
-                participants(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]),
-                Bytes::from("data"),
+                &participants(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]),
+                XactData::Encoded(Bytes::from("data")),
                 &pg_conn_pool,
             )
             .await?;

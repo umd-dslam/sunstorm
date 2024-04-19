@@ -11,6 +11,8 @@ mod proto {
     tonic::include_proto!("xactserver");
 }
 
+use std::fmt::Debug;
+
 pub use http::start_http_server;
 pub use id::{NodeId, XactId};
 pub use manager::Manager;
@@ -35,11 +37,17 @@ pub const DEFAULT_NODE_PORT: u16 = 23000;
 #[derive(Debug)]
 pub enum XsMessage {
     LocalXact {
-        data: Bytes,
+        data: XactData,
         commit_tx: oneshot::Sender<Option<RollbackInfo>>,
     },
     Prepare(proto::PrepareMessage),
     Vote(proto::VoteMessage),
+}
+
+#[derive(Debug)]
+pub enum XactData {
+    Encoded(Bytes),
+    Simulated { participants: bit_set::BitSet },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +96,12 @@ impl From<&RollbackReason> for vote_message::RollbackReason {
 pub struct Vote {
     from: NodeId,
     rollback_reason: Option<RollbackReason>,
+}
+
+impl Debug for Vote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Vote").field(&self.from).finish()
+    }
 }
 
 impl Vote {

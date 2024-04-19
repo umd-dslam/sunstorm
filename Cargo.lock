@@ -2633,6 +2633,7 @@ dependencies = [
  "pq_proto",
  "prometheus",
  "prost",
+ "rand",
  "routerify",
  "tokio",
  "tokio-postgres 0.7.7",

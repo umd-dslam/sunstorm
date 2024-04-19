@@ -99,9 +99,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let node_addrs = parse_node_addresses(cli.nodes);
+    let total_nodes = node_addrs.len();
     let cancel = CancellationToken::new();
 
-    let (pg_watcher_handle, watcher_rx) = start_pg_watcher(cli.listen_pg, cancel.clone());
+    let (local_xact_tx, local_xact_rx) = mpsc::channel(100);
+    let pg_watcher_handle = start_pg_watcher(cli.listen_pg, local_xact_tx.clone(), cancel.clone());
     let (node_handle, node_rx) = start_peer_listener(cli.listen_peer, cancel.clone());
     let manager_handle = start_manager(
         cli.node_id,
@@ -109,11 +111,17 @@ async fn main() -> anyhow::Result<()> {
         cli.max_conn_pool_size_pg,
         node_addrs,
         cli.max_conn_pool_size_peer,
-        watcher_rx,
+        local_xact_rx,
         node_rx,
         cancel.clone(),
     );
-    let http_server_handle = start_http_server(cli.listen_http, cancel.clone());
+    let http_server_handle = start_http_server(
+        cli.listen_http,
+        local_xact_tx,
+        cli.node_id,
+        total_nodes,
+        cancel.clone(),
+    );
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
@@ -169,12 +177,14 @@ type HandleAndReceiver = (
     mpsc::Receiver<XsMessage>,
 );
 
-fn start_pg_watcher(listen_pg: SocketAddr, cancel: CancellationToken) -> HandleAndReceiver {
-    let (watcher_tx, watcher_rx) = mpsc::channel(100);
-
+fn start_pg_watcher(
+    listen_pg: SocketAddr,
+    local_xact_tx: mpsc::Sender<XsMessage>,
+    cancel: CancellationToken,
+) -> JoinHandle<Result<(), anyhow::Error>> {
     info!("Listening to PostgreSQL on {}", listen_pg);
-    let pg_watcher = PgWatcher::new(listen_pg, watcher_tx);
-    let handle = thread::Builder::new()
+    let pg_watcher = PgWatcher::new(listen_pg, local_xact_tx);
+    thread::Builder::new()
         .name("pg watcher".into())
         .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
@@ -183,9 +193,7 @@ fn start_pg_watcher(listen_pg: SocketAddr, cancel: CancellationToken) -> HandleA
                 .block_on(pg_watcher.run(cancel))?;
             Ok(())
         })
-        .unwrap();
-
-    (handle, watcher_rx)
+        .unwrap()
 }
 
 fn start_peer_listener(listen_peer: SocketAddr, cancel: CancellationToken) -> HandleAndReceiver {

@@ -5,7 +5,14 @@ package xactserver;
 message PrepareMessage {
     uint32 from = 1;
     uint64 xact_id = 2;
-    bytes data = 3;
+    oneof data {
+        bytes encoded = 3;
+        SimulatedData simulated = 4;
+    }
+}
+
+message SimulatedData {
+    bytes participants = 1;
 }
 
 message VoteMessage {

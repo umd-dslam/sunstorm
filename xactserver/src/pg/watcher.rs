@@ -3,7 +3,7 @@
 //! This module contains [`PgWatcher`] which watches for new transaction data from the
 //! `remotexact` plugin in postgres.
 //!  
-use crate::{RollbackInfo, RollbackReason, XsMessage};
+use crate::{RollbackInfo, RollbackReason, XactData, XsMessage};
 use anyhow::Context;
 use bytes::{BufMut, Bytes, BytesMut};
 use neon_postgres_backend::{self, AuthType, PostgresBackend, PostgresBackendTCP, QueryError};
@@ -26,14 +26,14 @@ use tracing::{debug, error, info};
 ///
 pub struct PgWatcher {
     listen_pg: SocketAddr,
-    xact_manager_tx: mpsc::Sender<XsMessage>,
+    local_xact_tx: mpsc::Sender<XsMessage>,
 }
 
 impl PgWatcher {
-    pub fn new(listen_pg: SocketAddr, xact_manager_tx: mpsc::Sender<XsMessage>) -> Self {
+    pub fn new(listen_pg: SocketAddr, local_xact_tx: mpsc::Sender<XsMessage>) -> Self {
         Self {
             listen_pg,
-            xact_manager_tx,
+            local_xact_tx,
         }
     }
 
@@ -48,7 +48,7 @@ impl PgWatcher {
                     match msg {
                         Ok((socket, peer_addr)) => {
                             debug!("accepted connection from {}", peer_addr);
-                            tokio::spawn(Self::conn_main(self.xact_manager_tx.clone(), socket));
+                            tokio::spawn(Self::conn_main(self.local_xact_tx.clone(), socket));
                         }
                         Err(err) => {
                             error!("accept() failed: {:?}", err);
@@ -66,10 +66,10 @@ impl PgWatcher {
     }
 
     async fn conn_main(
-        xact_manager_tx: mpsc::Sender<XsMessage>,
+        local_xact_tx: mpsc::Sender<XsMessage>,
         socket: tokio::net::TcpStream,
     ) -> anyhow::Result<()> {
-        let mut handler = PgWatcherHandler { xact_manager_tx };
+        let mut handler = PgWatcherHandler { local_xact_tx };
         let pgbackend = PostgresBackendTCP::new(socket, AuthType::Trust, None)?;
         pgbackend
             .run(&mut handler, std::future::pending::<()>)
@@ -79,7 +79,7 @@ impl PgWatcher {
 }
 
 struct PgWatcherHandler {
-    xact_manager_tx: mpsc::Sender<XsMessage>,
+    local_xact_tx: mpsc::Sender<XsMessage>,
 }
 
 #[async_trait::async_trait]
@@ -123,9 +123,9 @@ where
             let (commit_tx, commit_rx) = oneshot::channel();
 
             // Pass the transaction buffer to the xact manager
-            self.xact_manager_tx
+            self.local_xact_tx
                 .send(XsMessage::LocalXact {
-                    data: copy_data_bytes,
+                    data: XactData::Encoded(copy_data_bytes),
                     commit_tx,
                 })
                 .await
