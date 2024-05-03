@@ -44,6 +44,9 @@ subnets:
     eu-west-2a: subnet-01d4009a020da46df
     eu-west-2b: subnet-0e2ad7f39541c75df
     eu-west-2c: subnet-0c7df5b4993c904ef
+  eu-central-1:
+    eu-central-1a: subnet-0c369fddb550ea1dd
+    eu-central-1b: subnet-025d46a6f2afc2a4a
   ap-northeast-1:
     ap-northeast-1a: subnet-0e16430fc4f55394b
     ap-northeast-1c: subnet-0cf3ecec581c0f801
@@ -64,6 +67,7 @@ security_groups:
   us-west-2: sg-0f6f9d8fed793f085
   eu-west-1: sg-0af119315a40fa0f9
   eu-west-2: sg-0ec4e1d97b23dff45
+  eu-central-1: sg-092519e404f943a7c
   ap-northeast-1: sg-040ea3f4ab853fb24
   ap-northeast-2: sg-0e2fa8c2439db5867
   ap-southeast-1: sg-06d7f712e0c63f678

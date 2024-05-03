@@ -12,3 +12,5 @@ venv/
 
 tools/workspace/
 results/
+
+.DS_Store
